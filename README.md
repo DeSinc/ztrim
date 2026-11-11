@@ -1,6 +1,10 @@
 # ztrim (Lossy & Lossless Video Trimmer)
 
-A lightning-fast, pure native Rust video trimming and compression desktop tool built with **egui** and hardware-accelerated **NVIDIA NVENC VBR encoding** (inspired by Vegas Pro's render profiles), plus instant **Lossless Cut stream copying** (`-c copy`).
+A lightning-fast, pure native Rust video trimming and compression desktop tool built with **egui** and hardware-accelerated **NVIDIA NVENC VBR encoding**, plus instant **Lossless Cut stream copying** (`-c copy`).
+
+https://github.com/user-attachments/assets/be507e37-3843-47ca-b13c-3132e88698a4
+
+<img width="559" height="241" alt="ztrim_5xWvVOk3xx" src="https://github.com/user-attachments/assets/c9f6838f-8275-4538-93c0-dc93a19949b1" />
 
 ---
 
