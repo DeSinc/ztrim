@@ -63,3 +63,9 @@ cargo build --release
 
 The resulting binary will be placed at `target/release/ztrim.exe`.
 
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+

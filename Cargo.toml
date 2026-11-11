@@ -2,6 +2,8 @@
 name = "ztrim"
 version = "0.1.3"
 edition = "2024"
+license = "MIT"
+authors = ["DeSinc"]
 build = "build.rs"
 
 [[bin]]
