@@ -1,0 +1,60 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.old
+ztrim.exe
+
+# Model weights and checkpoints (never commit model files!)
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.onnx
+*.gguf
+*.pth
+
+# Image and media outputs/caches
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
+*.mp4
+*.mkv
+*.mov
+*.avi
+
+# Runtime logs & data
+*.log
+presets.json
+config.json
+queue_history.json
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.gemini/
+scratch/
+
+# Local deployment & agent config
+deploy.ps1
+GEMINI.md
+
+# OS artifacts
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
+# Whitelist assets
+!assets/
+!assets/**

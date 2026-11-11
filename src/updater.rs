@@ -1,0 +1,497 @@
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use serde::{Deserialize, Serialize};
+
+pub const GITHUB_API_URL: &str = "https://api.github.com/repos/DeSinc/ztrim/releases/latest";
+pub const SERVER_PRIMARY_URL: &str = "https://desinc.ax/ztrim/version.json";
+pub const SERVER_FALLBACK_URL: &str = "https://desinc.my.to/ztrim/version.json";
+#[allow(dead_code)]
+pub const UPDATE_URL: &str = SERVER_PRIMARY_URL;
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+pub struct RemoteVersion {
+    pub version: String,
+    pub download_url: String,
+    #[serde(default)]
+    pub download_url_linux: Option<String>,
+    #[serde(default)]
+    pub changelog: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct UpdaterState {
+    pub checked: bool,
+    pub update_available: bool,
+    pub latest_version: String,
+    pub download_url: String,
+    pub changelog: Option<String>,
+    pub error: Option<String>,
+    pub downloading: bool,
+    pub download_progress: f32,
+    pub update_applied: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+/// Compares two semver-like version strings ("0.2.8" vs "0.2.7").
+/// Returns true if `remote` is strictly newer than `current`.
+pub fn is_newer(remote: &str, current: &str) -> bool {
+    let parse_nums = |s: &str| -> Vec<u32> {
+        s.trim_start_matches('v')
+            .split('.')
+            .filter_map(|part| part.split('-').next().and_then(|n| n.parse::<u32>().ok()))
+            .collect()
+    };
+    let r_nums = parse_nums(remote);
+    let c_nums = parse_nums(current);
+
+    let max_len = r_nums.len().max(c_nums.len());
+    for i in 0..max_len {
+        let r_val = r_nums.get(i).copied().unwrap_or(0);
+        let c_val = c_nums.get(i).copied().unwrap_or(0);
+        if r_val > c_val {
+            return true;
+        } else if r_val < c_val {
+            return false;
+        }
+    }
+    false
+}
+
+/// Parses a GitHub Release JSON string into a RemoteVersion
+pub fn parse_github_release(json_text: &str) -> Result<RemoteVersion, String> {
+    let release: GithubRelease = serde_json::from_str(json_text)
+        .map_err(|e| format!("Failed to parse GitHub release JSON: {e}"))?;
+    let version = release.tag_name.trim_start_matches('v').trim().to_string();
+
+    let win_asset = release.assets.iter().find(|a| {
+        a.name.eq_ignore_ascii_case("ztrim.exe") || a.name.ends_with(".exe")
+    }).map(|a| a.browser_download_url.clone());
+
+    let linux_asset = release.assets.iter().find(|a| {
+        let name = a.name.to_lowercase();
+        (name.contains("linux") || name == "ztrim") && !name.ends_with(".exe") && !name.ends_with(".json")
+    }).map(|a| a.browser_download_url.clone());
+
+    let download_url = if cfg!(windows) {
+        win_asset.unwrap_or_else(|| {
+            format!(
+                "https://github.com/DeSinc/ztrim/releases/download/{}/ztrim.exe",
+                release.tag_name
+            )
+        })
+    } else {
+        linux_asset.clone().unwrap_or_else(|| {
+            format!(
+                "https://github.com/DeSinc/ztrim/releases/download/{}/ztrim-linux-x86_64",
+                release.tag_name
+            )
+        })
+    };
+
+    Ok(RemoteVersion {
+        version,
+        download_url,
+        download_url_linux: linux_asset,
+        changelog: release.body,
+    })
+}
+
+/// Parses server version.json content, handling possible BOM prefixes
+pub fn parse_server_version(json_text: &str) -> Result<RemoteVersion, String> {
+    let clean = json_text.trim_start_matches('\u{feff}').trim();
+    let mut rv: RemoteVersion = serde_json::from_str(clean)
+        .map_err(|e| format!("Failed to parse server version JSON: {e}"))?;
+    if !cfg!(windows) {
+        if let Some(ref l_url) = rv.download_url_linux {
+            rv.download_url = l_url.clone();
+        }
+    }
+    Ok(rv)
+}
+
+/// Fetches the latest release from GitHub API
+pub fn fetch_github_version(client: &reqwest::blocking::Client) -> Result<RemoteVersion, String> {
+    let resp = client
+        .get(GITHUB_API_URL)
+        .header(reqwest::header::USER_AGENT, "ztrim-Updater")
+        .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+        .send()
+        .map_err(|e| format!("GitHub request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("GitHub returned HTTP {}", resp.status()));
+    }
+
+    let text = resp.text().map_err(|e| format!("Failed to read GitHub response: {e}"))?;
+    parse_github_release(&text)
+}
+
+/// Fetches version from server: tries desinc.ax first, falls back to desinc.my.to if unreachable
+pub fn fetch_server_version(client: &reqwest::blocking::Client) -> Result<RemoteVersion, String> {
+    // 1. Try primary server (.ax)
+    if let Ok(resp) = client.get(SERVER_PRIMARY_URL).send() {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text() {
+                if let Ok(v) = parse_server_version(&text) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+
+    // 2. If .ax failed or could not be resolved, fall back to .my.to
+    let resp = client
+        .get(SERVER_FALLBACK_URL)
+        .send()
+        .map_err(|e| format!("Could not reach server fallback: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Server returned HTTP {}", resp.status()));
+    }
+    let text = resp.text().map_err(|e| format!("Failed to read server response: {e}"))?;
+    parse_server_version(&text)
+}
+
+/// Selects the best candidate between GitHub and server releases.
+/// Checks GitHub first, then compares with server: picking whichever is strictly newest.
+/// If versions are identical, GitHub is favored as the primary distribution channel.
+pub fn select_best_version(gh: Option<RemoteVersion>, srv: Option<RemoteVersion>) -> Option<RemoteVersion> {
+    match (gh, srv) {
+        (Some(g), Some(s)) => {
+            if is_newer(&s.version, &g.version) {
+                Some(s)
+            } else {
+                Some(g)
+            }
+        }
+        (Some(g), None) => Some(g),
+        (None, Some(s)) => Some(s),
+        (None, None) => None,
+    }
+}
+
+/// Checks if the primary network connection is metered to prevent unconfirmed large downloads.
+#[cfg(windows)]
+pub fn is_metered_connection() -> bool {
+    use windows_sys::Win32::System::Com::*;
+    use windows_sys::core::GUID;
+
+    const CLSID_NETWORK_LIST_MANAGER: GUID = GUID {
+        data1: 0xDCB00C01,
+        data2: 0x570F,
+        data3: 0x4A9B,
+        data4: [0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B],
+    };
+    const IID_INETWORK_COST_MANAGER: GUID = GUID {
+        data1: 0xDCB00008,
+        data2: 0x570F,
+        data3: 0x4A9B,
+        data4: [0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B],
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
+        let mut obj: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_NETWORK_LIST_MANAGER,
+            std::ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_INETWORK_COST_MANAGER,
+            &mut obj,
+        );
+        if hr == 0 && !obj.is_null() {
+            type GetCostFn = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32, *const std::ffi::c_void) -> i32;
+            type ReleaseFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+
+            let vtbl = *(obj as *const *const usize);
+            let get_cost: GetCostFn = std::mem::transmute(*vtbl.add(3));
+            let release: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+
+            let mut cost: u32 = 0;
+            let hr_cost = get_cost(obj, &mut cost, std::ptr::null());
+            release(obj);
+            if hr_cost == 0 {
+                const METERED_MASK: u32 = 0x2 | 0x4 | 0x10000 | 0x20000 | 0x40000 | 0x80000;
+                return (cost & METERED_MASK) != 0;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_metered_connection() -> bool {
+    false
+}
+
+pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        let current_ver = env!("CARGO_PKG_VERSION");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(6))
+            .build();
+
+        let client = match client {
+            Ok(c) => c,
+            Err(e) => {
+                let mut st = state.lock().unwrap();
+                st.checked = true;
+                st.error = Some(format!("HTTP client error: {e}"));
+                ctx.request_repaint();
+                return;
+            }
+        };
+
+        let gh_res = fetch_github_version(&client);
+        let srv_res = fetch_server_version(&client);
+
+        let best = select_best_version(gh_res.ok(), srv_res.ok());
+
+        match best {
+            Some(info) => {
+                let is_new = is_newer(&info.version, current_ver);
+                let is_metered = is_metered_connection();
+                let dl_valid = !info.download_url.is_empty() && (cfg!(windows) || !info.download_url.ends_with(".exe"));
+                let should_auto_dl = {
+                    let mut st = state.lock().unwrap();
+                    st.checked = true;
+                    st.latest_version = info.version.clone();
+                    st.download_url = info.download_url.clone();
+                    st.changelog = info.changelog;
+                    st.error = None;
+                    st.update_available = is_new && dl_valid;
+                    is_new && dl_valid && !st.downloading && !st.update_applied && !is_metered
+                };
+                if should_auto_dl {
+                    download_and_install_update(state.clone(), ctx.clone());
+                }
+            }
+            None => {
+                let mut st = state.lock().unwrap();
+                st.checked = true;
+                st.error = Some("Could not check for updates from GitHub or mirror servers".to_string());
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+/// Detaches and cleanly restarts the newly updated ztrim application
+pub fn restart_application() {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let target_exe = if exe.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("old")).unwrap_or(false) {
+        exe.with_extension("exe")
+    } else {
+        exe
+    };
+
+    if !target_exe.is_file() {
+        eprintln!("restart_application: target executable not found at {}", target_exe.display());
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+
+        let target_str = target_exe.to_string_lossy().to_string();
+        let ps_cmd = format!(
+            "Start-Sleep -Milliseconds 600; Start-Process -FilePath '{}'",
+            target_str.replace('\'', "''")
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
+        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
+        let _ = cmd.spawn();
+        std::process::exit(0);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new(target_exe).spawn();
+        std::process::exit(0);
+    }
+}
+
+/// Downloads new ztrim executable and stages it for replacement
+pub fn download_and_install_update(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        let dl_url = {
+            let mut st = state.lock().unwrap();
+            st.downloading = true;
+            st.download_progress = 0.0;
+            st.error = None;
+            st.download_url.clone()
+        };
+        ctx.request_repaint();
+
+        let res = (|| -> Result<(), String> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(300))
+                .build()
+                .map_err(|e| e.to_string())?;
+
+            let mut resp = client.get(&dl_url).send().map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("Download failed with status {}", resp.status()));
+            }
+
+            let total_size = resp.content_length().unwrap_or(0);
+            let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+            let temp_new = exe_path.with_extension("update.tmp");
+
+            let mut file = std::fs::File::create(&temp_new).map_err(|e| e.to_string())?;
+            let mut downloaded = 0u64;
+            let mut buf = [0u8; 64 * 1024];
+
+            use std::io::{Read, Write};
+            loop {
+                let n = resp.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                downloaded += n as u64;
+
+                if total_size > 0 {
+                    let prog = (downloaded as f32 / total_size as f32).clamp(0.0, 1.0);
+                    state.lock().unwrap().download_progress = prog;
+                    ctx.request_repaint();
+                }
+            }
+            drop(file);
+
+            // On Windows, rename current exe to .old, and rename downloaded tmp to current exe
+            let old_exe = exe_path.with_extension("old");
+            let _ = std::fs::remove_file(&old_exe);
+            std::fs::rename(&exe_path, &old_exe).map_err(|e| format!("Failed to move running executable: {e}"))?;
+            std::fs::rename(&temp_new, &exe_path).map_err(|e| {
+                // Try to restore old if failed
+                let _ = std::fs::rename(&old_exe, &exe_path);
+                format!("Failed to activate new executable: {e}")
+            })?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755));
+            }
+
+            Ok(())
+        })();
+
+        let mut st = state.lock().unwrap();
+        st.downloading = false;
+        match res {
+            Ok(()) => {
+                st.update_applied = true;
+                st.update_available = false;
+            }
+            Err(e) => {
+                st.error = Some(e);
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_newer() {
+        assert!(is_newer("0.2.8", "0.2.7"));
+        assert!(is_newer("v0.2.8", "0.2.7"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(!is_newer("0.2.7", "0.2.7"));
+        assert!(!is_newer("0.2.6", "0.2.7"));
+    }
+
+    #[test]
+    fn test_parse_version_with_bom() {
+        let raw_with_bom = "\u{feff}{\"version\": \"0.2.8\", \"download_url\": \"https://desinc.my.to/ztrim/ztrim.exe\", \"download_url_linux\": \"https://desinc.my.to/ztrim/ztrim-linux-x86_64\"}";
+        let parsed = parse_server_version(raw_with_bom);
+        assert!(parsed.is_ok());
+        let info = parsed.unwrap();
+        assert_eq!(info.version, "0.2.8");
+        assert_eq!(info.download_url_linux, Some("https://desinc.my.to/ztrim/ztrim-linux-x86_64".into()));
+    }
+
+    #[test]
+    fn test_parse_github_release() {
+        let json = r#"{
+            "tag_name": "v0.1.5",
+            "body": "Lossless cutting performance optimizations",
+            "assets": [
+                {
+                    "name": "ztrim.exe",
+                    "browser_download_url": "https://github.com/DeSinc/ztrim/releases/download/v0.1.5/ztrim.exe"
+                }
+            ]
+        }"#;
+        let parsed = parse_github_release(json).unwrap();
+        assert_eq!(parsed.version, "0.1.5");
+        assert_eq!(parsed.download_url, "https://github.com/DeSinc/ztrim/releases/download/v0.1.5/ztrim.exe");
+        assert_eq!(parsed.changelog.as_deref(), Some("Lossless cutting performance optimizations"));
+    }
+
+    #[test]
+    fn test_select_best_version() {
+        let gh_older = Some(RemoteVersion {
+            version: "0.1.5".into(),
+            download_url: "https://github.com/.../0.1.5.exe".into(),
+            download_url_linux: None,
+            changelog: None,
+        });
+        let srv_newer = Some(RemoteVersion {
+            version: "0.1.6".into(),
+            download_url: "https://desinc.ax/.../0.1.6.exe".into(),
+            download_url_linux: None,
+            changelog: None,
+        });
+        let gh_newer = Some(RemoteVersion {
+            version: "0.1.7".into(),
+            download_url: "https://github.com/.../0.1.7.exe".into(),
+            download_url_linux: None,
+            changelog: None,
+        });
+
+        // Server newer than GitHub -> pick server
+        let res = select_best_version(gh_older.clone(), srv_newer.clone());
+        assert_eq!(res.unwrap().version, "0.1.6");
+
+        // GitHub newer than server -> pick GitHub
+        let res = select_best_version(gh_newer.clone(), srv_newer.clone());
+        assert_eq!(res.unwrap().version, "0.1.7");
+
+        // Equal version -> favor GitHub
+        let srv_same = Some(RemoteVersion {
+            version: "0.1.5".into(),
+            download_url: "https://desinc.ax/.../0.1.5.exe".into(),
+            download_url_linux: None,
+            changelog: None,
+        });
+        let res = select_best_version(gh_older.clone(), srv_same);
+        assert_eq!(res.unwrap().download_url, "https://github.com/.../0.1.5.exe");
+
+        // One source failed
+        assert_eq!(select_best_version(gh_older.clone(), None).unwrap().version, "0.1.5");
+        assert_eq!(select_best_version(None, srv_newer.clone()).unwrap().version, "0.1.6");
+        assert!(select_best_version(None, None).is_none());
+    }
+}
