@@ -329,35 +329,36 @@ pub fn restart_application() {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
 
         let target_str = target_exe.to_string_lossy().to_string();
         let work_dir_str = work_dir.to_string_lossy().to_string();
         let old_str = old_exe.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
 
         let ps_cmd = format!(
-            "for ($i=0; $i -lt 10; $i++) {{ Start-Sleep -Milliseconds 300; if (-not (Test-Path -LiteralPath '{}')) {{ break }}; Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue }}; Start-Process -FilePath '{}' -WorkingDirectory '{}'",
+            "Start-Sleep -Milliseconds 600; if (Test-Path -LiteralPath '{}') {{ Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue }}; Start-Process -FilePath '{}' -WorkingDirectory '{}'",
             old_str.replace('\'', "''"),
             old_str.replace('\'', "''"),
             target_str.replace('\'', "''"),
             work_dir_str.replace('\'', "''")
         );
 
-        // Try spawning with CREATE_BREAKAWAY_FROM_JOB first. If parent is inside a restrictive job object
-        // (e.g. IDE, terminal host), CreateProcess fails with Access is denied (code 5), so fall back without it.
         let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
+        cmd.args(["-NoProfile", "-Command", &ps_cmd]);
         cmd.current_dir(work_dir);
-        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.creation_flags(CREATE_NO_WINDOW);
         let spawn_res = cmd.spawn();
 
         if spawn_res.is_err() {
-            let mut fallback = std::process::Command::new("powershell");
-            fallback.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
+            // Fallback to cmd.exe
+            let cmd_script = format!(
+                "ping 127.0.0.1 -n 2 >nul & if exist \"{}\" del /f /q \"{}\" & start \"\" /D \"{}\" \"{}\"",
+                old_str, old_str, work_dir_str, target_str
+            );
+            let mut fallback = std::process::Command::new("cmd.exe");
+            fallback.args(["/C", &cmd_script]);
             fallback.current_dir(work_dir);
-            fallback.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            fallback.creation_flags(CREATE_NO_WINDOW);
             let _ = fallback.spawn();
         }
 
@@ -368,7 +369,7 @@ pub fn restart_application() {
         if let Some(old) = old_exe {
             let _ = std::fs::remove_file(old);
         }
-        let _ = std::process::Command::new(target_exe).current_dir(work_dir).spawn();
+        let _ = std::process::Command::new(&target_exe).current_dir(work_dir).spawn();
         std::process::exit(0);
     }
 }
@@ -545,25 +546,45 @@ mod tests {
     #[cfg(windows)]
     fn test_spawn_restart_cmd() {
         use std::os::windows::process::CommandExt;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let ps_cmd = "Get-Date";
+        let test_flag = std::env::temp_dir().join("ztrim_test_restart.flag");
+        let test_old = std::env::temp_dir().join("ztrim_test_restart.old");
+        let _ = std::fs::remove_file(&test_flag);
+        let _ = std::fs::write(&test_old, "old binary");
+
+        let old_str = test_old.to_string_lossy().to_string();
+        let flag_str = test_flag.to_string_lossy().to_string();
+
+        let ps_cmd = format!(
+            "Start-Sleep -Milliseconds 200; if (Test-Path -LiteralPath '{}') {{ Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue }}; [System.IO.File]::WriteAllText('{}', 'OK')",
+            old_str.replace('\'', "''"),
+            old_str.replace('\'', "''"),
+            flag_str.replace('\'', "''")
+        );
+
         let mut cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd]);
-        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        cmd.args(["-NoProfile", "-Command", &ps_cmd]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
         let res = cmd.spawn();
+        assert!(res.is_ok(), "Failed to spawn powershell: {:?}", res);
 
-        let final_res = if res.is_err() {
-            let mut fallback = std::process::Command::new("powershell");
-            fallback.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd]);
-            fallback.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-            fallback.spawn()
-        } else {
-            res
-        };
+        // Wait up to 3 seconds for flag file to be created
+        let start = std::time::Instant::now();
+        let mut created = false;
+        while start.elapsed().as_secs() < 3 {
+            if test_flag.is_file() {
+                created = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
-        assert!(final_res.is_ok(), "Restart process spawning must succeed via primary or fallback: {:?}", final_res);
+        let old_exists = test_old.is_file();
+        let _ = std::fs::remove_file(&test_flag);
+        let _ = std::fs::remove_file(&test_old);
+
+        assert!(created, "PowerShell restart script did NOT create flag file!");
+        assert!(!old_exists, "PowerShell restart script did NOT delete old file!");
     }
 }
