@@ -293,7 +293,14 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
 pub fn restart_application() {
     let exe = std::env::current_exe().unwrap_or_default();
     let target_exe = if exe.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("old")).unwrap_or(false) {
-        exe.with_extension("exe")
+        #[cfg(windows)]
+        {
+            exe.with_extension("exe")
+        }
+        #[cfg(not(windows))]
+        {
+            exe.with_extension("")
+        }
     } else {
         exe
     };

@@ -24,9 +24,9 @@ https://github.com/user-attachments/assets/be507e37-3843-47ca-b13c-3132e88698a4
 - **Smart Adaptive Action Button**:
   - Automatically switches between **"COMPRESS"** (full video) and **"TRIM & COMPRESS"** when trim points are set.
   - When compression is unticked, switches to **"TRIM (LOSSLESS)"** for instantaneous, 0% quality loss direct stream copying (`-c copy`).
-- **NVIDIA NVENC VBR Quality Presets (Vegas Pro Style)**:
-  - **1440p**: 9 Mb/s avg, 30 Mb/s max (NVIDIA NVENC HEVC)
+- **NVIDIA NVENC VBR Quality Presets**:
   - **1080p**: 6 Mb/s avg, 25 Mb/s max (NVIDIA NVENC HEVC)
+  - **1440p**: 9 Mb/s avg, 30 Mb/s max (NVIDIA NVENC HEVC)
   - **4K**: 14 Mb/s avg, 45 Mb/s max (NVIDIA NVENC HEVC)
   - **Source Res (Custom VBR)**: Keep original resolution.
   - Custom preset creator: save your own bitrate and resolution presets (`+ Save as New Preset...`).

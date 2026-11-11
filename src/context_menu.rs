@@ -1,8 +1,10 @@
+#[cfg(windows)]
 use std::process::Command;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub fn is_context_menu_registered() -> bool {

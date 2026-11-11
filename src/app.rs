@@ -1,7 +1,7 @@
 use crate::context_menu::{is_context_menu_registered, register_context_menu, unregister_context_menu};
 use crate::folder::{is_video_file, FolderNavigator};
 use crate::history::TrimHistory;
-use crate::presets::{QualityPreset, TargetResolution, VideoCodec};
+use crate::presets::{AutoQualityLevel, QualityPreset, TargetResolution, VideoCodec};
 use crate::render::{JobState, RenderJobRequest, RenderManager};
 use crate::video::VideoPlayer;
 use eframe::egui::{
@@ -27,6 +27,10 @@ fn default_audio_boost() -> f32 {
     10.0
 }
 
+fn default_source_res() -> TargetResolution {
+    TargetResolution::Source
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AppConfig {
     pub compress_enabled: bool,
@@ -46,6 +50,8 @@ pub struct AppConfig {
     pub persist_history: bool,
     #[serde(default)]
     pub normalise_audio: bool,
+    #[serde(default)]
+    pub normalise_audio_apply_to_export: bool,
     #[serde(default = "default_audio_ratio")]
     pub audio_normalise_ratio: f32,
     #[serde(default = "default_audio_thresh")]
@@ -54,6 +60,10 @@ pub struct AppConfig {
     pub audio_normalise_boost_db: f32,
     #[serde(default)]
     pub audio_normalise_advanced_open: bool,
+    #[serde(default = "default_source_res")]
+    pub selected_res: TargetResolution,
+    #[serde(default)]
+    pub auto_quality_level: AutoQualityLevel,
 }
 
 impl Default for AppConfig {
@@ -69,10 +79,13 @@ impl Default for AppConfig {
             window_maximized: false,
             persist_history: true,
             normalise_audio: false,
+            normalise_audio_apply_to_export: false,
             audio_normalise_ratio: 6.0,
             audio_normalise_thresh_db: -25.0,
             audio_normalise_boost_db: 10.0,
             audio_normalise_advanced_open: false,
+            selected_res: TargetResolution::Source,
+            auto_quality_level: AutoQualityLevel::Med,
         }
     }
 }
@@ -119,6 +132,9 @@ const GREEN_HOVER: Color32 = Color32::from_rgb(16, 185, 129);
 const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
 const RED: Color32 = Color32::from_rgb(248, 113, 113);
 const BLUE: Color32 = Color32::from_rgb(59, 130, 246);
+const UNDO_BANNER_TOTAL_DURATION_SECS: f32 = 10.0;
+const UNDO_BANNER_SWIPE_SECS: f32 = 0.350;
+const UNDO_BANNER_HOLD_SECS: f32 = UNDO_BANNER_TOTAL_DURATION_SECS - UNDO_BANNER_SWIPE_SECS;
 
 fn draw_update_arrow_icon(p: &egui::Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.8, color);
@@ -151,6 +167,66 @@ fn draw_restart_icon(p: &egui::Painter, center: Pos2, color: Color32) {
         p.line_segment([tip, tip + vec2(2.5, -2.5)], stroke);
         p.line_segment([tip, tip + vec2(-2.5, -1.0)], stroke);
     }
+}
+
+pub fn draw_scissors_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.6, color);
+    // Two circular finger loops
+    p.circle_stroke(center + vec2(-5.0, -3.0), 2.5, stroke);
+    p.circle_stroke(center + vec2(-5.0, 3.0), 2.5, stroke);
+    // Blades crossing through pivot
+    p.line_segment([center + vec2(-2.5, -2.5), center + vec2(6.5, 3.5)], stroke);
+    p.line_segment([center + vec2(-2.5, 2.5), center + vec2(6.5, -3.5)], stroke);
+    // Pivot pin
+    p.circle_filled(center + vec2(0.5, 0.0), 1.2, color);
+}
+
+pub fn draw_trash_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    // Lid handle loop
+    p.line_segment([center + vec2(-2.5, -6.5), center + vec2(2.5, -6.5)], stroke);
+    p.line_segment([center + vec2(-2.5, -6.5), center + vec2(-2.5, -5.0)], stroke);
+    p.line_segment([center + vec2(2.5, -6.5), center + vec2(2.5, -5.0)], stroke);
+    // Lid horizontal bar
+    p.line_segment([center + vec2(-6.5, -4.5), center + vec2(6.5, -4.5)], Stroke::new(1.5, color));
+    // Bin body (tapered trapezoid)
+    p.line_segment([center + vec2(-5.0, -3.5), center + vec2(-4.0, 6.0)], stroke);
+    p.line_segment([center + vec2(5.0, -3.5), center + vec2(4.0, 6.0)], stroke);
+    p.line_segment([center + vec2(-4.0, 6.0), center + vec2(4.0, 6.0)], stroke);
+    // Vertical ribs inside bin
+    p.line_segment([center + vec2(0.0, -2.0), center + vec2(0.0, 4.5)], Stroke::new(1.2, color));
+    p.line_segment([center + vec2(-2.2, -2.0), center + vec2(-1.8, 4.5)], Stroke::new(1.2, color));
+    p.line_segment([center + vec2(2.2, -2.0), center + vec2(1.8, 4.5)], Stroke::new(1.2, color));
+}
+
+pub fn setup_custom_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // 1. Embed Outfit (OFL modern smooth rounded geometric font)
+    fonts.font_data.insert(
+        "outfit".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../assets/Outfit.ttf"))),
+    );
+
+    // 2. On Windows, optionally load Microsoft PhagsPa Bold if installed
+    #[cfg(windows)]
+    {
+        if let Ok(phagspa_bytes) = std::fs::read("C:\\Windows\\Fonts\\phagspab.ttf") {
+            fonts.font_data.insert(
+                "phagspab".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(phagspa_bytes)),
+            );
+        }
+    }
+
+    let button_family = egui::FontFamily::Name("button_font".into());
+    let family_fonts = fonts.families.entry(button_family).or_default();
+    family_fonts.push("outfit".to_owned());
+    #[cfg(windows)]
+    family_fonts.push("phagspab".to_owned());
+    family_fonts.push("Ubuntu-Light".to_owned());
+
+    ctx.set_fonts(fonts);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -243,9 +319,10 @@ pub enum UndoAction {
 
 #[derive(Clone, Debug)]
 pub struct UndoBannerState {
-    pub title: String,
+    pub file_name: String,
     pub action: UndoAction,
     pub trigger_time: Instant,
+    pub dismissing_since: Option<Instant>,
 }
 
 pub struct ZTrimApp {
@@ -264,9 +341,11 @@ pub struct ZTrimApp {
     pub selected_res: TargetResolution,
     pub audio_bitrate_kbps: u32,
     pub replace_in_place: bool,
+    pub auto_quality_level: AutoQualityLevel,
 
     // Audio normalisation controls
     pub normalise_audio: bool,
+    pub normalise_audio_apply_to_export: bool,
     pub audio_normalise_ratio: f32,
     pub audio_normalise_thresh_db: f32,
     pub audio_normalise_boost_db: f32,
@@ -326,6 +405,11 @@ impl ZTrimApp {
             let persisted = RenderManager::load_queue_history();
             render_mgr.load_persisted_jobs(persisted);
         }
+        let initial_max_job_id = render_mgr
+            .active_jobs
+            .lock()
+            .map(|jobs| jobs.iter().map(|j| j.job_id).max().unwrap_or(0))
+            .unwrap_or(0);
         let recycle_bin_watcher = crate::recycle::RecycleBinWatcher::new();
         let updater = std::sync::Arc::new(std::sync::Mutex::new(crate::updater::UpdaterState::default()));
         if let Some(ref ctx) = egui_ctx {
@@ -349,10 +433,12 @@ impl ZTrimApp {
             avg_bitrate: 9.0,
             max_bitrate: 30.0,
             selected_codec: VideoCodec::NvencHevc,
-            selected_res: TargetResolution::P1440,
+            selected_res: config.selected_res,
             audio_bitrate_kbps: 192,
             replace_in_place: config.replace_in_place,
+            auto_quality_level: config.auto_quality_level,
             normalise_audio: config.normalise_audio,
+            normalise_audio_apply_to_export: config.normalise_audio_apply_to_export,
             audio_normalise_ratio: config.audio_normalise_ratio,
             audio_normalise_thresh_db: config.audio_normalise_thresh_db,
             audio_normalise_boost_db: config.audio_normalise_boost_db,
@@ -373,7 +459,7 @@ impl ZTrimApp {
             was_playing_before_scrub: false,
             timeline_drag_occurred: false,
             undo_banner: None,
-            last_banner_job_id: 0,
+            last_banner_job_id: initial_max_job_id,
             persist_history: config.persist_history,
             recycle_bin_watcher,
             last_file: config.last_file.clone(),
@@ -425,10 +511,13 @@ impl ZTrimApp {
             window_maximized: self.window_maximized,
             persist_history: self.persist_history,
             normalise_audio: self.normalise_audio,
+            normalise_audio_apply_to_export: self.normalise_audio_apply_to_export,
             audio_normalise_ratio: self.audio_normalise_ratio,
             audio_normalise_thresh_db: self.audio_normalise_thresh_db,
             audio_normalise_boost_db: self.audio_normalise_boost_db,
             audio_normalise_advanced_open: self.audio_normalise_advanced_open,
+            selected_res: self.selected_res,
+            auto_quality_level: self.auto_quality_level,
         };
         cfg.save();
         self.saved_window_width = self.window_width;
@@ -437,15 +526,37 @@ impl ZTrimApp {
         self.window_dirty_since = None;
     }
 
+    pub fn is_auto_preset(&self) -> bool {
+        self.presets
+            .get(self.selected_preset_idx)
+            .map_or(false, |p| p.id == "auto")
+    }
+
+    pub fn apply_auto_bitrate(&mut self) {
+        let orig_h = self.player.as_ref().map(|p| p.original_height).unwrap_or(1080);
+        let effective_h = if let Some(max_h) = self.selected_res.max_height() {
+            orig_h.min(max_h)
+        } else {
+            orig_h
+        };
+        let (avg, max) = crate::presets::auto_bitrate_range(effective_h, self.auto_quality_level);
+        self.avg_bitrate = avg;
+        self.max_bitrate = max;
+    }
+
     pub fn sync_from_preset_idx(&mut self, idx: usize) {
         if idx < self.presets.len() {
             self.selected_preset_idx = idx;
             let p = &self.presets[idx];
-            self.avg_bitrate = p.avg_bitrate_mbps;
-            self.max_bitrate = p.max_bitrate_mbps;
             self.selected_codec = p.codec;
-            self.selected_res = p.resolution;
             self.audio_bitrate_kbps = p.audio_bitrate_kbps;
+            if p.id == "auto" {
+                self.apply_auto_bitrate();
+            } else {
+                self.avg_bitrate = p.avg_bitrate_mbps;
+                self.max_bitrate = p.max_bitrate_mbps;
+                self.selected_res = p.resolution;
+            }
         }
     }
 
@@ -498,6 +609,9 @@ impl ZTrimApp {
                 self.trim_redo_stack.clear();
                 self.trim_drag_initial = None;
                 self.was_playing_before_scrub = false;
+                if self.is_auto_preset() {
+                    self.apply_auto_bitrate();
+                }
                 self.save_config();
                 self.set_status(format!("Loaded: {}", path.file_name().unwrap_or_default().to_string_lossy()));
             }
@@ -647,7 +761,7 @@ impl ZTrimApp {
             compress: self.compress_enabled,
             preset: current_preset,
             replace_in_place: self.replace_in_place,
-            normalise_audio: self.normalise_audio,
+            normalise_audio: self.normalise_audio && self.normalise_audio_apply_to_export,
             audio_normalise_ratio: self.audio_normalise_ratio,
             audio_normalise_thresh_db: self.audio_normalise_thresh_db,
             audio_normalise_boost_db: self.audio_normalise_boost_db,
@@ -709,10 +823,12 @@ impl ZTrimApp {
                     self.render_mgr.save_queue_history();
                 }
                 self.recycle_bin_watcher.refresh();
+                self.last_banner_job_id = self.last_banner_job_id.max(job_id);
                 self.undo_banner = Some(UndoBannerState {
-                    title: format!("Deleted {}", file_name),
+                    file_name: file_name.clone(),
                     action: UndoAction::Delete { job_id },
                     trigger_time: Instant::now(),
+                    dismissing_since: None,
                 });
                 self.set_status(format!("Moved {} to Recycle Bin", file_name));
 
@@ -775,6 +891,7 @@ impl ZTrimApp {
                         if let Ok(mut jobs) = self.render_mgr.active_jobs.lock() {
                             if let Some(j) = jobs.iter_mut().find(|j| j.job_id == job_id) {
                                 j.is_undone = true;
+                                j.undone_at = Some(Instant::now());
                             }
                         }
                         if let Some(ref b) = self.undo_banner {
@@ -807,6 +924,7 @@ impl ZTrimApp {
                         if let Ok(mut jobs) = self.render_mgr.active_jobs.lock() {
                             if let Some(j) = jobs.iter_mut().find(|j| j.job_id == job_id) {
                                 j.is_undone = true;
+                                j.undone_at = Some(Instant::now());
                             }
                         }
                         if let Some(ref b) = self.undo_banner {
@@ -851,13 +969,14 @@ impl ZTrimApp {
 
     fn action_button_text(&self) -> &'static str {
         let has_trim = self.player.as_ref().map_or(false, |p| p.has_custom_trim());
+        let normalise_export = self.normalise_audio && self.normalise_audio_apply_to_export;
         if self.compress_enabled {
             if has_trim {
                 "TRIM & COMPRESS"
             } else {
                 "COMPRESS"
             }
-        } else if self.normalise_audio {
+        } else if normalise_export {
             if has_trim {
                 "TRIM & NORMALISE"
             } else {
@@ -879,26 +998,41 @@ impl eframe::App for ZTrimApp {
             self.recycle_bin_watcher.refresh();
         }
 
-        // Check for completed render jobs to trigger 15-second undo banner
+        // Check for completed render jobs to trigger 10-second undo banner
         if let Ok(jobs) = self.render_mgr.active_jobs.lock() {
             for j in jobs.iter() {
                 if j.state == JobState::Finished && j.job_id > self.last_banner_job_id {
                     self.last_banner_job_id = j.job_id;
                     if let Some(ref _backup_name) = j.backup_file_name {
                         self.undo_banner = Some(UndoBannerState {
-                            title: format!("Trimmed {}", j.file_name),
+                            file_name: j.file_name.clone(),
                             action: UndoAction::Trim { job_id: j.job_id },
                             trigger_time: Instant::now(),
+                            dismissing_since: None,
                         });
                     }
                 }
             }
         }
 
-        // Manage undo banner timer
+        // Manage undo banner timer and swipe-out animation
         if let Some(ref b) = self.undo_banner {
-            if b.trigger_time.elapsed().as_secs_f32() >= 15.0 {
+            let expired = if let Some(dt) = b.dismissing_since {
+                dt.elapsed().as_secs_f32() >= UNDO_BANNER_SWIPE_SECS
+            } else {
+                b.trigger_time.elapsed().as_secs_f32() >= UNDO_BANNER_TOTAL_DURATION_SECS
+            };
+
+            let is_animating = if b.dismissing_since.is_some() {
+                true
+            } else {
+                b.trigger_time.elapsed().as_secs_f32() >= UNDO_BANNER_HOLD_SECS
+            };
+
+            if expired {
                 self.undo_banner = None;
+            } else if is_animating {
+                ctx.request_repaint();
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
@@ -1338,32 +1472,29 @@ impl ZTrimApp {
                 self.render_update_button(ui);
 
                 // Windows Context Menu setup
-                let registered = is_context_menu_registered();
-                let menu_btn_txt = if registered {
-                    "Context Menu: On"
-                } else {
-                    "+ Add to Context Menu"
-                };
-                let menu_btn = egui::Button::new(
-                    RichText::new(menu_btn_txt)
-                        .size(11.0)
-                        .color(if registered { GREEN } else { DIM }),
-                );
-                if ui.add(menu_btn).clicked() {
-                    if registered {
-                        let _ = unregister_context_menu();
-                        self.set_status("Removed from Windows context menu".into());
+                if cfg!(windows) {
+                    let registered = is_context_menu_registered();
+                    let menu_btn_txt = if registered {
+                        "Context Menu: On"
                     } else {
-                        match register_context_menu() {
-                            Ok(_) => self.set_status("Added to Windows right-click context menu!".into()),
-                            Err(e) => self.set_status(format!("Registry error: {e}")),
+                        "+ Add to Context Menu"
+                    };
+                    let menu_btn = egui::Button::new(
+                        RichText::new(menu_btn_txt)
+                            .size(11.0)
+                            .color(if registered { GREEN } else { DIM }),
+                    );
+                    if ui.add(menu_btn).clicked() {
+                        if registered {
+                            let _ = unregister_context_menu();
+                            self.set_status("Removed from Windows context menu".into());
+                        } else {
+                            match register_context_menu() {
+                                Ok(_) => self.set_status("Added to Windows right-click context menu!".into()),
+                                Err(e) => self.set_status(format!("Registry error: {e}")),
+                            }
                         }
                     }
-                }
-
-                if ui.button("Clear History").clicked() {
-                    self.history.clear();
-                    self.set_status("Trim history reset".into());
                 }
 
                 if ui.button("Open Folder...").clicked() {
@@ -2023,7 +2154,180 @@ impl ZTrimApp {
         self.player = Some(player);
     }
 
+    fn render_floating_undo_banner(&mut self, ui: &mut egui::Ui, anchor_y: f32, panel_left: f32, panel_width: f32) {
+        let banner = match self.undo_banner.as_ref() {
+            Some(b) => b.clone(),
+            None => return,
+        };
+
+        // Detect whether undo is still possible in Windows Recycle Bin.
+        // If the file was removed from the bin (or already undone), dismiss the banner immediately.
+        let can_undo = match &banner.action {
+            UndoAction::Trim { job_id } => {
+                if let Ok(jobs) = self.render_mgr.active_jobs.lock() {
+                    jobs.iter().find(|j| j.job_id == *job_id).map_or(false, |j| {
+                        !j.is_undone
+                            && j.backup_file_name
+                                .as_ref()
+                                .map_or(false, |bak| self.recycle_bin_watcher.is_file_in_bin(bak))
+                    })
+                } else {
+                    false
+                }
+            }
+            UndoAction::Delete { job_id } => {
+                if let Ok(jobs) = self.render_mgr.active_jobs.lock() {
+                    jobs.iter().find(|j| j.job_id == *job_id).map_or(false, |j| {
+                        !j.is_undone && self.recycle_bin_watcher.is_file_in_bin(&j.file_name)
+                    })
+                } else {
+                    false
+                }
+            }
+        };
+
+        if !can_undo {
+            self.undo_banner = None;
+            return;
+        }
+
+        // Calculate swipe-out animation progress p in [0.0, 1.0]
+        let (p, expired) = if let Some(dt) = banner.dismissing_since {
+            let el = dt.elapsed().as_secs_f32();
+            if el >= UNDO_BANNER_SWIPE_SECS {
+                (1.0, true)
+            } else {
+                ((el / UNDO_BANNER_SWIPE_SECS).clamp(0.0, 1.0), false)
+            }
+        } else {
+            let el = banner.trigger_time.elapsed().as_secs_f32();
+            if el >= UNDO_BANNER_TOTAL_DURATION_SECS {
+                (1.0, true)
+            } else if el >= UNDO_BANNER_HOLD_SECS {
+                let swipe_el = el - UNDO_BANNER_HOLD_SECS;
+                ((swipe_el / UNDO_BANNER_SWIPE_SECS).clamp(0.0, 1.0), false)
+            } else {
+                (0.0, false)
+            }
+        };
+
+        if expired {
+            self.undo_banner = None;
+            return;
+        }
+
+        if p > 0.0 {
+            ui.ctx().request_repaint();
+        }
+
+        // Ease-in curve ("slow to start, builds up speed until it's fully off screen" in 350ms)
+        let ease_in = p * p * p;
+        let exit_distance = panel_width + 40.0;
+        let offset_x = exit_distance * ease_in;
+
+        let banner_h = 38.0;
+        let banner_top_y = anchor_y - 6.0 - banner_h;
+        let banner_pos = Pos2::new(panel_left + offset_x, banner_top_y);
+
+        let mut undo_triggered = false;
+        let mut undo_dismissed = false;
+
+        egui::Area::new(egui::Id::new("floating_undo_banner"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(banner_pos)
+            .interactable(p < 0.8)
+            .show(ui.ctx(), |ui| {
+                ui.set_width(panel_width);
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(26, 26, 30))
+                    .stroke(Stroke::new(1.5, ACCENT_GLOW))
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(panel_width - 20.0);
+                        ui.set_max_width(panel_width - 20.0);
+                        ui.horizontal(|ui| {
+                            // 1. Right-to-left layout for action controls (laid out first, prevents underlapping)
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let close_resp = ui.add(
+                                    egui::Button::new(RichText::new("x").size(11.0).color(DIM))
+                                        .frame(false)
+                                        .min_size(vec2(16.0, 16.0)),
+                                )
+                                .on_hover_text("Dismiss");
+                                if close_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if close_resp.clicked() {
+                                    undo_dismissed = true;
+                                }
+
+                                let undo_btn = egui::Button::new(
+                                    RichText::new("Undo").size(11.5).strong().color(Color32::WHITE),
+                                )
+                                .fill(ACCENT)
+                                .stroke(Stroke::new(1.0, ACCENT_GLOW))
+                                .corner_radius(6)
+                                .min_size(vec2(48.0, 22.0));
+
+                                let undo_tip = match banner.action {
+                                    UndoAction::Trim { .. } => "Restore original untrimmed video from Recycle Bin",
+                                    UndoAction::Delete { .. } => "Restore deleted clip from Recycle Bin",
+                                };
+
+                                let u_resp = ui.add(undo_btn).on_hover_text(undo_tip);
+                                if u_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if u_resp.clicked() {
+                                    undo_triggered = true;
+                                }
+
+                                // 2. Left-to-right in the remaining space for the tag and middle-truncated filename
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new("Undo:").size(11.5).strong().color(AMBER));
+
+                                    let max_w = (ui.available_width() - 8.0).max(10.0);
+                                    let font_id = egui::FontId::proportional(11.5);
+                                    let fitted_name = truncate_filename_apple_style(
+                                        |s| ui.painter().layout_no_wrap(s.to_string(), font_id.clone(), Color32::WHITE).size().x,
+                                        &banner.file_name,
+                                        max_w,
+                                    );
+
+                                    let label_tip = format!("{}\nClick Undo to restore from Recycle Bin", banner.file_name);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(fitted_name)
+                                                .size(11.5)
+                                                .strong()
+                                                .color(TEXT),
+                                        )
+                                    )
+                                    .on_hover_text(label_tip);
+                                });
+                            });
+                        });
+                    });
+            });
+
+        if undo_triggered {
+            self.undo_current_banner();
+        } else if undo_dismissed {
+            if let Some(ref mut b) = self.undo_banner {
+                if b.dismissing_since.is_none() {
+                    b.dismissing_since = Some(Instant::now());
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
+
     fn render_right_pane(&mut self, ui: &mut egui::Ui) {
+        let panel_left = ui.cursor().min.x;
+        let panel_width = ui.available_width();
+        let mut banner_anchor_y = None;
+
         // Bottom-anchored action bar so TRIM/COMPRESS and Prev/Skip stay anchored in the
         // bottom-right corner, directly adjacent to the end of the timeline scrub bar.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -2050,111 +2354,137 @@ impl ZTrimApp {
 
             ui.add_space(6.0);
 
-            // The BIG Action Button (TRIM/COMPRESS)
-            let btn_text = self.action_button_text();
-            let action_btn = egui::Button::new(
-                RichText::new(btn_text)
-                    .size(15.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(ACCENT)
-            .stroke(Stroke::new(1.5, ACCENT_GLOW))
-            .corner_radius(8)
-            .min_size(vec2(ui.available_width(), 44.0));
-
+            // BIG Action Button (TRIM/COMPRESS)
             let can_render = self.player.is_some();
-            if ui.add_enabled(can_render, action_btn).clicked() {
+            let btn_text = self.action_button_text();
+            let (rect, resp) = ui.allocate_exact_size(
+                vec2(ui.available_width(), 44.0),
+                if can_render { Sense::click() } else { Sense::hover() },
+            );
+            if can_render && resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if can_render && resp.clicked() {
                 self.submit_current_job_and_advance();
             }
 
+            let is_pressed = can_render && resp.is_pointer_button_down_on();
+            let is_hovered = can_render && resp.hovered();
+
+            let bg = if !can_render {
+                Color32::from_rgb(28, 30, 36)
+            } else if is_pressed {
+                Color32::from_rgb(29, 78, 216)
+            } else if is_hovered {
+                Color32::from_rgb(45, 115, 255)
+            } else {
+                ACCENT
+            };
+
+            let border = if !can_render {
+                Stroke::new(1.0, Color32::from_rgb(45, 47, 54))
+            } else if is_hovered {
+                Stroke::new(1.8, Color32::from_rgb(147, 197, 253))
+            } else {
+                Stroke::new(1.5, ACCENT_GLOW)
+            };
+
+            let text_color = if !can_render {
+                DIM
+            } else {
+                Color32::WHITE
+            };
+
+            {
+                let p = ui.painter();
+                p.rect_filled(rect, 8.0, bg);
+                p.rect_stroke(rect, 8.0, border, StrokeKind::Inside);
+
+                let font_id = egui::FontId::new(15.0, egui::FontFamily::Name("button_font".into()));
+                let text_w = p.layout_no_wrap(btn_text.to_string(), font_id.clone(), text_color).size().x;
+                let icon_w = 16.0;
+                let gap = 8.0;
+                let total_w = icon_w + gap + text_w;
+                let start_x = rect.center().x - total_w / 2.0;
+
+                let icon_center = Pos2::new(start_x + icon_w / 2.0, rect.center().y);
+                draw_scissors_icon(&p, icon_center, text_color);
+
+                let text_pos = Pos2::new(start_x + icon_w + gap, rect.center().y);
+                p.text(text_pos, egui::Align2::LEFT_CENTER, btn_text, font_id, text_color);
+            }
+
             ui.add_space(6.0);
 
-            // Red Delete Clip Button (instantly sends current video to Recycle Bin with 15s undo)
-            let del_btn = egui::Button::new(
-                RichText::new("DELETE CLIP")
-                    .size(13.5)
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(Color32::from_rgb(185, 38, 38))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(239, 68, 68)))
-            .corner_radius(8)
-            .min_size(vec2(ui.available_width(), 36.0));
-
+            // Delete Clip Button
             let can_delete = self.player.is_some();
-            if ui.add_enabled(can_delete, del_btn).clicked() {
+            let (del_rect, del_resp) = ui.allocate_exact_size(
+                vec2(ui.available_width(), 36.0),
+                if can_delete { Sense::click() } else { Sense::hover() },
+            );
+            if can_delete && del_resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if can_delete && del_resp.clicked() {
                 self.delete_current_clip();
             }
 
+            let is_del_pressed = can_delete && del_resp.is_pointer_button_down_on();
+            let is_del_hovered = can_delete && del_resp.hovered();
+
+            let del_bg = if !can_delete {
+                Color32::from_rgb(28, 30, 36)
+            } else if is_del_pressed {
+                Color32::from_rgb(153, 27, 27)
+            } else if is_del_hovered {
+                Color32::from_rgb(220, 38, 38)
+            } else {
+                Color32::from_rgb(185, 28, 28)
+            };
+
+            let del_border = if !can_delete {
+                Stroke::new(1.0, Color32::from_rgb(45, 47, 54))
+            } else if is_del_hovered {
+                Stroke::new(1.5, Color32::from_rgb(248, 113, 113))
+            } else {
+                Stroke::new(1.0, Color32::from_rgb(239, 68, 68))
+            };
+
+            let del_text_color = if !can_delete {
+                DIM
+            } else {
+                Color32::WHITE
+            };
+
+            {
+                let p = ui.painter();
+                p.rect_filled(del_rect, 8.0, del_bg);
+                p.rect_stroke(del_rect, 8.0, del_border, StrokeKind::Inside);
+
+                let del_font_id = egui::FontId::new(13.5, egui::FontFamily::Name("button_font".into()));
+                let text_w = p.layout_no_wrap("DELETE CLIP".to_string(), del_font_id.clone(), del_text_color).size().x;
+                let icon_w = 14.0;
+                let gap = 7.0;
+                let total_w = icon_w + gap + text_w;
+                let start_x = del_rect.center().x - total_w / 2.0;
+
+                let icon_center = Pos2::new(start_x + icon_w / 2.0, del_rect.center().y);
+                draw_trash_icon(&p, icon_center, del_text_color);
+
+                let text_pos = Pos2::new(start_x + icon_w + gap, del_rect.center().y);
+                p.text(text_pos, egui::Align2::LEFT_CENTER, "DELETE CLIP", del_font_id, del_text_color);
+            }
+
             ui.add_space(6.0);
 
-            // Floating 15-second Undo Banner
-            let mut undo_triggered = false;
-            let mut undo_dismissed = false;
-
-            if let Some(ref banner) = self.undo_banner {
-                let elapsed = banner.trigger_time.elapsed().as_secs_f32();
-                if elapsed < 15.0 {
-                    let remaining = (15.0 - elapsed).ceil() as u32;
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(26, 26, 30))
-                        .stroke(Stroke::new(1.5, ACCENT_GLOW))
-                        .corner_radius(8)
-                        .inner_margin(Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Undo:").size(12.0).strong().color(AMBER));
-                                ui.add(egui::Label::new(
-                                    RichText::new(format!("{} ({}s)", banner.title, remaining))
-                                        .size(11.5)
-                                        .strong()
-                                        .color(TEXT),
-                                ).truncate());
-
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let close_resp = ui.add(
-                                        egui::Button::new(RichText::new("x").size(11.0).color(DIM))
-                                            .frame(false)
-                                            .min_size(vec2(16.0, 16.0)),
-                                    )
-                                    .on_hover_text("Dismiss");
-                                    if close_resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if close_resp.clicked() {
-                                        undo_dismissed = true;
-                                    }
-
-                                    let undo_btn = egui::Button::new(
-                                        RichText::new("Undo").size(12.0).strong().color(Color32::WHITE)
-                                    )
-                                    .fill(ACCENT)
-                                    .stroke(Stroke::new(1.0, ACCENT_GLOW))
-                                    .corner_radius(6)
-                                    .min_size(vec2(52.0, 24.0));
-
-                                    if ui.add(undo_btn).clicked() {
-                                        undo_triggered = true;
-                                    }
-                                });
-                            });
-                        });
-                    ui.add_space(6.0);
-                }
-            }
-
-            if undo_triggered {
-                self.undo_current_banner();
-            } else if undo_dismissed {
-                self.undo_banner = None;
-            }
-
-            // Status message above the action buttons with padding so it never overlaps or bumps buttons
+            // Status message directly above the action buttons with padding so it never overlaps or bumps buttons
+            let mut status_seen = false;
             if let Some((ref msg, time)) = self.status_message {
                 if time.elapsed().as_secs() < 8 {
-                    ui.add(egui::Label::new(RichText::new(msg).size(11.0).color(AMBER)).truncate())
+                    let resp = ui.add(egui::Label::new(RichText::new(msg).size(11.0).color(AMBER)).truncate())
                         .on_hover_text(msg);
+                    banner_anchor_y = Some(resp.rect.top());
+                    status_seen = true;
                     ui.add_space(6.0);
                 }
             }
@@ -2162,6 +2492,10 @@ impl ZTrimApp {
             let (sep_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
             ui.painter().line_segment([sep_rect.left_center(), sep_rect.right_center()], Stroke::new(1.0, LINE));
             ui.add_space(6.0);
+
+            if !status_seen {
+                banner_anchor_y = Some(sep_rect.top());
+            }
 
             // Remaining upper area flows top-down inside a scrollable area
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -2214,6 +2548,26 @@ impl ZTrimApp {
                                     self.save_config();
                                 }
 
+                                if self.is_auto_preset() {
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Auto Range:").size(11.5).color(TEXT));
+                                        let mut level_idx = self.auto_quality_level.to_index();
+                                        let slider = egui::Slider::new(&mut level_idx, 0..=2)
+                                            .custom_formatter(|val, _| match val.round() as usize {
+                                                0 => "Low".to_string(),
+                                                1 => "Med".to_string(),
+                                                _ => "High".to_string(),
+                                            })
+                                            .show_value(true);
+                                        if ui.add(slider).changed() {
+                                            self.auto_quality_level = AutoQualityLevel::from_index(level_idx);
+                                            self.apply_auto_bitrate();
+                                            self.save_config();
+                                        }
+                                    });
+                                }
+
                                 ui.add_space(8.0);
                                 heading(ui, "VARIABLE BITRATE (VBR)");
 
@@ -2264,6 +2618,7 @@ impl ZTrimApp {
                                 // Resolution
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Target Res:").size(11.5).color(TEXT));
+                                    let prev_res = self.selected_res;
                                     egui::ComboBox::from_id_salt("res_select")
                                         .selected_text(self.selected_res.display_name())
                                         .show_ui(ui, |ui| {
@@ -2273,6 +2628,12 @@ impl ZTrimApp {
                                             ui.selectable_value(&mut self.selected_res, TargetResolution::P4K, TargetResolution::P4K.display_name());
                                             ui.selectable_value(&mut self.selected_res, TargetResolution::P720, TargetResolution::P720.display_name());
                                         });
+                                    if self.selected_res != prev_res {
+                                        self.save_config();
+                                        if self.is_auto_preset() {
+                                            self.apply_auto_bitrate();
+                                        }
+                                    }
                                 });
 
                                 ui.add_space(6.0);
@@ -2304,6 +2665,16 @@ impl ZTrimApp {
                             }
 
                             if self.normalise_audio {
+                                ui.add_space(4.0);
+                                if ui.checkbox(&mut self.normalise_audio_apply_to_export, "Apply to exported video").changed() {
+                                    self.save_config();
+                                }
+                                ui.label(
+                                    RichText::new("Unchecked = preview only")
+                                        .size(10.0)
+                                        .color(DIM),
+                                );
+
                                 ui.add_space(4.0);
                                 let adv_icon = if self.audio_normalise_advanced_open { "v" } else { ">" };
                                 let adv_resp = ui.add(
@@ -2349,7 +2720,7 @@ impl ZTrimApp {
                                     if sl_resp.drag_stopped() {
                                         drag_stopped = true;
                                     }
-                                    ui.label(RichText::new("Quiet audio below this volume is boosted to match the louder audio.").size(10.0).color(DIM));
+                                    ui.label(RichText::new("Quiet audio below this volume is boosted to match louder audio").size(10.0).color(DIM));
 
                                     ui.add_space(6.0);
 
@@ -2374,7 +2745,7 @@ impl ZTrimApp {
                                     if sl_resp.drag_stopped() {
                                         drag_stopped = true;
                                     }
-                                    ui.label(RichText::new("Lifts quiet mic and game audio into audible range without clipping.").size(10.0).color(DIM));
+                                    ui.label(RichText::new("Lifts quiet audio into audible range without clipping").size(10.0).color(DIM));
 
                                     if slider_changed {
                                         self.save_config();
@@ -2436,13 +2807,47 @@ impl ZTrimApp {
                         let mut job_to_remove = None;
 
                         card(ui, |ui| {
-                            if let Ok(jobs) = self.render_mgr.active_jobs.lock() {
+                            if let Ok(mut jobs) = self.render_mgr.active_jobs.lock() {
                                 if jobs.is_empty() {
                                     ui.label(RichText::new("No render or trim history yet.").size(11.0).color(DIM));
                                 } else {
-                                    for j in jobs.iter().rev() {
+                                    for j in jobs.iter_mut().rev() {
+                                        if j.is_undone && j.undone_at.is_none() {
+                                            j.undone_at = Some(Instant::now());
+                                        }
+
+                                        let (offset_x, should_remove) = if j.is_undone {
+                                            let undone_since = j.undone_at.unwrap_or_else(Instant::now);
+                                            let el = undone_since.elapsed().as_secs_f32();
+                                            const UNDONE_HOLD_SECS: f32 = 0.8;
+                                            const UNDONE_SWIPE_SECS: f32 = 0.350;
+                                            if el >= UNDONE_HOLD_SECS + UNDONE_SWIPE_SECS {
+                                                (0.0, true)
+                                            } else if el >= UNDONE_HOLD_SECS {
+                                                ui.ctx().request_repaint();
+                                                let p = ((el - UNDONE_HOLD_SECS) / UNDONE_SWIPE_SECS).clamp(0.0, 1.0);
+                                                let ease_in = p * p * p;
+                                                let exit_distance = ui.available_width() + 50.0;
+                                                (exit_distance * ease_in, false)
+                                            } else {
+                                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                                                (0.0, false)
+                                            }
+                                        } else {
+                                            (0.0, false)
+                                        };
+
+                                        if should_remove {
+                                            job_to_remove = Some(j.job_id);
+                                            continue;
+                                        }
+
                                         let mut row_clicked = false;
-                                        ui.horizontal(|ui| {
+                                        let (row_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+                                        let shifted_rect = row_rect.translate(vec2(offset_x, 0.0));
+                                        let mut row_ui = ui.new_child(egui::UiBuilder::new().max_rect(shifted_rect));
+
+                                        row_ui.horizontal(|ui| {
                                             // 1. Right-to-left layout for action buttons & status (cuts off sooner, prevents overlap)
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 // Clear 'x' button (ASCII 'x', never an ASCII box!)
@@ -2511,7 +2916,7 @@ impl ZTrimApp {
                                                     }
                                                     JobState::Deleted => {
                                                         if j.is_undone {
-                                                            ui.label(RichText::new("Restored").size(10.5).color(DIM));
+                                                            ui.label(RichText::new("Undone").size(10.5).color(DIM));
                                                         } else {
                                                             if can_undo {
                                                                 let undo_btn = egui::Button::new(
@@ -2578,7 +2983,10 @@ impl ZTrimApp {
                                             ui.add(egui::ProgressBar::new(*progress).animate(true));
                                         }
                                         let (sep_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                                        ui.painter().line_segment([sep_rect.left_center(), sep_rect.right_center()], Stroke::new(1.0, LINE));
+                                        ui.painter().line_segment(
+                                            [sep_rect.left_center() + vec2(offset_x, 0.0), sep_rect.right_center() + vec2(offset_x, 0.0)],
+                                            Stroke::new(1.0, LINE),
+                                        );
                                     }
                                 }
                             }
@@ -2606,6 +3014,10 @@ impl ZTrimApp {
                     });
             });
         });
+
+        if let Some(anchor_y) = banner_anchor_y {
+            self.render_floating_undo_banner(ui, anchor_y, panel_left, panel_width);
+        }
     }
 }
 
@@ -2748,10 +3160,13 @@ mod tests {
         cfg.window_height = Some(900.0);
         cfg.window_maximized = true;
         cfg.normalise_audio = true;
+        cfg.normalise_audio_apply_to_export = true;
         cfg.audio_normalise_ratio = 8.0;
         cfg.audio_normalise_thresh_db = -30.0;
         cfg.audio_normalise_boost_db = 14.0;
         cfg.audio_normalise_advanced_open = true;
+        cfg.selected_res = TargetResolution::P1440;
+        cfg.auto_quality_level = AutoQualityLevel::High;
 
         let json = serde_json::to_string(&cfg).expect("serialize");
         let loaded: AppConfig = serde_json::from_str(&json).expect("deserialize");
@@ -2764,10 +3179,13 @@ mod tests {
         assert_eq!(loaded.window_maximized, true);
         assert_eq!(loaded.persist_history, true);
         assert_eq!(loaded.normalise_audio, true);
+        assert_eq!(loaded.normalise_audio_apply_to_export, true);
         assert_eq!(loaded.audio_normalise_ratio, 8.0);
         assert_eq!(loaded.audio_normalise_thresh_db, -30.0);
         assert_eq!(loaded.audio_normalise_boost_db, 14.0);
         assert_eq!(loaded.audio_normalise_advanced_open, true);
+        assert_eq!(loaded.selected_res, TargetResolution::P1440);
+        assert_eq!(loaded.auto_quality_level, AutoQualityLevel::High);
 
         // Test backward compatibility without last_file and window settings in json
         let old_json = r#"{"compress_enabled":true,"replace_in_place":false,"selected_preset_idx":1}"#;
@@ -2778,10 +3196,13 @@ mod tests {
         assert_eq!(old_cfg.window_maximized, false);
         assert_eq!(old_cfg.persist_history, true);
         assert_eq!(old_cfg.normalise_audio, false);
+        assert_eq!(old_cfg.normalise_audio_apply_to_export, false);
         assert_eq!(old_cfg.audio_normalise_ratio, 6.0);
         assert_eq!(old_cfg.audio_normalise_thresh_db, -25.0);
         assert_eq!(old_cfg.audio_normalise_boost_db, 10.0);
         assert_eq!(old_cfg.audio_normalise_advanced_open, false);
+        assert_eq!(old_cfg.selected_res, TargetResolution::Source);
+        assert_eq!(old_cfg.auto_quality_level, AutoQualityLevel::Med);
     }
 
     #[test]
@@ -3020,11 +3441,186 @@ mod tests {
         // Compress disabled, normalise disabled
         app.compress_enabled = false;
         app.normalise_audio = false;
+        app.normalise_audio_apply_to_export = false;
         assert_eq!(app.action_button_text(), "TRIM (LOSSLESS)");
 
-        // Compress disabled, normalise enabled, no player
+        // Compress disabled, normalise enabled (preview only) -> still lossless export!
         app.compress_enabled = false;
         app.normalise_audio = true;
+        app.normalise_audio_apply_to_export = false;
+        assert_eq!(app.action_button_text(), "TRIM (LOSSLESS)");
+
+        // Compress disabled, normalise enabled and applied to export, no player
+        app.compress_enabled = false;
+        app.normalise_audio = true;
+        app.normalise_audio_apply_to_export = true;
         assert_eq!(app.action_button_text(), "NORMALISE AUDIO");
+    }
+
+    #[test]
+    fn test_startup_with_persisted_jobs_has_no_stale_undo_banner() {
+        use crate::render::{JobProgressInfo, JobState};
+
+        let mut app = ZTrimApp::new(None, None);
+        // Simulate loaded persisted jobs from history
+        let sample = vec![
+            JobProgressInfo {
+                job_id: 10,
+                file_name: "video1.mp4".into(),
+                input_path: PathBuf::from("C:/video1.mp4"),
+                backup_file_name: Some("video1.orig_bak_10.mp4".into()),
+                state: JobState::Finished,
+                finished_at: Some(Instant::now()),
+                is_undone: false,
+                undone_at: None,
+            },
+            JobProgressInfo {
+                job_id: 11,
+                file_name: "video2.mp4".into(),
+                input_path: PathBuf::from("C:/video2.mp4"),
+                backup_file_name: Some("video2.orig_bak_11.mp4".into()),
+                state: JobState::Finished,
+                finished_at: Some(Instant::now()),
+                is_undone: false,
+                undone_at: None,
+            },
+        ];
+        app.render_mgr.load_persisted_jobs(sample);
+
+        // Compute max job id exactly as done on startup
+        let initial_max_job_id = app
+            .render_mgr
+            .active_jobs
+            .lock()
+            .map(|jobs| jobs.iter().map(|j| j.job_id).max().unwrap_or(0))
+            .unwrap_or(0);
+        app.last_banner_job_id = initial_max_job_id;
+
+        assert_eq!(app.last_banner_job_id, 11);
+        assert!(app.undo_banner.is_none());
+
+        // Verify that running the completed jobs check loop does NOT trigger undo banner
+        if let Ok(jobs) = app.render_mgr.active_jobs.lock() {
+            for j in jobs.iter() {
+                if j.state == JobState::Finished && j.job_id > app.last_banner_job_id {
+                    app.last_banner_job_id = j.job_id;
+                    if let Some(ref _backup_name) = j.backup_file_name {
+                        app.undo_banner = Some(UndoBannerState {
+                            file_name: j.file_name.clone(),
+                            action: UndoAction::Trim { job_id: j.job_id },
+                            trigger_time: Instant::now(),
+                            dismissing_since: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Banner MUST remain None after check
+        assert!(app.undo_banner.is_none());
+        assert_eq!(app.last_banner_job_id, 11);
+    }
+
+    #[test]
+    fn test_undo_banner_duration_10_seconds() {
+        use std::time::Duration;
+
+        assert_eq!(UNDO_BANNER_TOTAL_DURATION_SECS, 10.0);
+        assert_eq!(UNDO_BANNER_SWIPE_SECS, 0.350);
+
+        let now = Instant::now();
+        // At 9.0s elapsed: still in hold period, not swiping yet
+        let state_active = UndoBannerState {
+            file_name: "test.mp4".into(),
+            action: UndoAction::Trim { job_id: 1 },
+            trigger_time: now - Duration::from_secs_f32(9.0),
+            dismissing_since: None,
+        };
+        let el = state_active.trigger_time.elapsed().as_secs_f32();
+        assert!(el < UNDO_BANNER_TOTAL_DURATION_SECS);
+        assert!(el < UNDO_BANNER_HOLD_SECS);
+
+        // At 9.825s elapsed: in swipe-out phase (halfway through 350ms)
+        let state_swiping = UndoBannerState {
+            file_name: "test.mp4".into(),
+            action: UndoAction::Trim { job_id: 1 },
+            trigger_time: now - Duration::from_secs_f32(9.65 + 0.175),
+            dismissing_since: None,
+        };
+        let el_swiping = state_swiping.trigger_time.elapsed().as_secs_f32();
+        assert!(el_swiping >= UNDO_BANNER_HOLD_SECS);
+        assert!(el_swiping < UNDO_BANNER_TOTAL_DURATION_SECS);
+        let p = ((el_swiping - UNDO_BANNER_HOLD_SECS) / UNDO_BANNER_SWIPE_SECS).clamp(0.0, 1.0);
+        assert!((p - 0.5).abs() < 0.05);
+        let ease_in = p * p * p;
+        // Ease in starts slow: at 50% time, progress is only 12.5% of the distance!
+        assert!((ease_in - 0.125).abs() < 0.05);
+
+        // At 10.1s elapsed: fully expired
+        let state_expired = UndoBannerState {
+            file_name: "test.mp4".into(),
+            action: UndoAction::Trim { job_id: 1 },
+            trigger_time: now - Duration::from_secs_f32(10.1),
+            dismissing_since: None,
+        };
+        let elapsed_expired = state_expired.trigger_time.elapsed().as_secs_f32();
+        assert!(elapsed_expired >= UNDO_BANNER_TOTAL_DURATION_SECS);
+    }
+
+    #[test]
+    fn test_default_auto_preset_and_export() {
+        let cfg = AppConfig::default();
+        // Default preset must be Auto (index 0)
+        assert_eq!(cfg.selected_preset_idx, 0);
+        // Default export must be Original (Keep Source)
+        assert_eq!(cfg.selected_res, TargetResolution::Source);
+        // Default auto quality level is Med
+        assert_eq!(cfg.auto_quality_level, AutoQualityLevel::Med);
+
+        let mut app = ZTrimApp::new(None, None);
+        app.sync_from_preset_idx(0);
+        assert!(app.is_auto_preset());
+        assert_eq!(app.presets[0].id, "auto");
+        assert_eq!(app.presets[0].resolution, TargetResolution::Source);
+    }
+
+    #[test]
+    fn test_undone_job_swipes_out_timing() {
+        use std::time::Duration;
+
+        let now = Instant::now();
+        const UNDONE_HOLD_SECS: f32 = 0.8;
+        const UNDONE_SWIPE_SECS: f32 = 0.350;
+
+        // At 0.4s: hold phase, offset_x = 0.0, not expired
+        let undone_400ms = now - Duration::from_secs_f32(0.4);
+        let el = undone_400ms.elapsed().as_secs_f32();
+        assert!(el < UNDONE_HOLD_SECS);
+
+        // At 0.975s: half-way through swipe (800ms + 175ms)
+        let undone_975ms = now - Duration::from_secs_f32(0.8 + 0.175);
+        let el_swipe = undone_975ms.elapsed().as_secs_f32();
+        assert!(el_swipe >= UNDONE_HOLD_SECS);
+        assert!(el_swipe < UNDONE_HOLD_SECS + UNDONE_SWIPE_SECS);
+        let p = ((el_swipe - UNDONE_HOLD_SECS) / UNDONE_SWIPE_SECS).clamp(0.0, 1.0);
+        assert!((p - 0.5).abs() < 0.05);
+        let ease_in = p * p * p;
+        assert!((ease_in - 0.125).abs() < 0.05);
+
+        // At 1.2s: fully expired
+        let undone_1200ms = now - Duration::from_secs_f32(1.2);
+        let el_expired = undone_1200ms.elapsed().as_secs_f32();
+        assert!(el_expired >= UNDONE_HOLD_SECS + UNDONE_SWIPE_SECS);
+    }
+
+    #[test]
+    fn test_setup_custom_fonts() {
+        let ctx = egui::Context::default();
+        setup_custom_fonts(&ctx);
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+        let font_id = egui::FontId::new(15.0, egui::FontFamily::Name("button_font".into()));
+        let galley = ctx.fonts_mut(|f| f.layout_no_wrap("TRIM / COMPRESS".into(), font_id, Color32::WHITE));
+        assert!(galley.size().x > 10.0);
     }
 }

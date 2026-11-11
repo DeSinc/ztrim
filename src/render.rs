@@ -11,6 +11,7 @@ use std::thread;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,8 @@ pub struct JobProgressInfo {
     #[serde(skip)]
     pub finished_at: Option<std::time::Instant>,
     pub is_undone: bool,
+    #[serde(skip)]
+    pub undone_at: Option<std::time::Instant>,
 }
 
 #[allow(dead_code)]
@@ -110,6 +113,7 @@ impl RenderManager {
                 state: JobState::Queued,
                 finished_at: None,
                 is_undone: false,
+                undone_at: None,
             });
         }
 
@@ -134,6 +138,7 @@ impl RenderManager {
                 state: JobState::Deleted,
                 finished_at: Some(std::time::Instant::now()),
                 is_undone: false,
+                undone_at: None,
             });
         }
         id
@@ -600,6 +605,7 @@ mod tests {
                 state: JobState::Finished,
                 finished_at: None,
                 is_undone: false,
+                undone_at: None,
             },
             JobProgressInfo {
                 job_id: 11,
@@ -612,6 +618,7 @@ mod tests {
                 },
                 finished_at: None,
                 is_undone: false,
+                undone_at: None,
             },
         ];
         mgr.load_persisted_jobs(sample);

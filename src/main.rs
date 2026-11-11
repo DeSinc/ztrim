@@ -58,6 +58,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ztrim",
         opts,
-        Box::new(|cc| Ok(Box::new(app::ZTrimApp::new(initial_file, Some(cc.egui_ctx.clone()))))),
+        Box::new(|cc| {
+            app::setup_custom_fonts(&cc.egui_ctx);
+            Ok(Box::new(app::ZTrimApp::new(initial_file, Some(cc.egui_ctx.clone()))))
+        }),
     )
 }

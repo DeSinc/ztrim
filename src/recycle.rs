@@ -1,18 +1,33 @@
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 #[cfg(windows)]
+use std::io::{BufRead, BufReader};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Moves a file to the Windows Recycle Bin using the Win32 Shell API.
+#[cfg(not(windows))]
+fn get_linux_trash_dirs() -> Option<(PathBuf, PathBuf)> {
+    let base = dirs::data_local_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))?;
+    let trash = base.join("Trash");
+    let files = trash.join("files");
+    let info = trash.join("info");
+    let _ = std::fs::create_dir_all(&files);
+    let _ = std::fs::create_dir_all(&info);
+    Some((files, info))
+}
+
+/// Moves a file to the Windows Recycle Bin or Linux FreeDesktop Trash.
 pub fn send_to_recycle_bin(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("File does not exist: {}", path.display()));
@@ -83,12 +98,37 @@ pub fn send_to_recycle_bin(path: &Path) -> Result<(), String> {
 
     #[cfg(not(windows))]
     {
-        let _ = path;
-        Err("Recycle bin is only supported on Windows".into())
+        let abs_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let (files_dir, info_dir) = get_linux_trash_dirs()
+            .ok_or_else(|| "Could not determine Linux trash directory".to_string())?;
+
+        let file_name = abs_path
+            .file_name()
+            .ok_or_else(|| format!("Invalid file path: {}", abs_path.display()))?;
+        let target_in_trash = files_dir.join(file_name);
+
+        // Move to trash files directory (fallback to copy+delete for cross-filesystem moves)
+        if std::fs::rename(&abs_path, &target_in_trash).is_err() {
+            std::fs::copy(&abs_path, &target_in_trash)
+                .map_err(|e| format!("Failed to move file to trash: {e}"))?;
+            let _ = std::fs::remove_file(&abs_path);
+        }
+
+        // Create standard XDG trashinfo
+        let now_str = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let trashinfo_content = format!(
+            "[Trash Info]\nPath={}\nDeletionDate={}\n",
+            abs_path.display(),
+            now_str
+        );
+        let trashinfo_file = info_dir.join(format!("{}.trashinfo", file_name.to_string_lossy()));
+        let _ = std::fs::write(trashinfo_file, trashinfo_content);
+
+        Ok(())
     }
 }
 
-/// Restores a file from the Windows Recycle Bin by its filename and original directory.
+/// Restores a file from the Windows Recycle Bin or Linux Trash by its filename and original directory.
 pub fn restore_from_recycle_bin(file_name: &str, orig_dir: &Path) -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
@@ -162,8 +202,27 @@ pub fn restore_from_recycle_bin(file_name: &str, orig_dir: &Path) -> Result<Path
 
     #[cfg(not(windows))]
     {
-        let _ = (file_name, orig_dir);
-        Err("Recycle bin is only supported on Windows".into())
+        let (files_dir, info_dir) = get_linux_trash_dirs()
+            .ok_or_else(|| "Could not determine Linux trash directory".to_string())?;
+
+        let trash_file = files_dir.join(file_name);
+        if !trash_file.exists() {
+            return Err(format!("File '{file_name}' not found in Trash"));
+        }
+
+        let target_expected_path = orig_dir.join(file_name);
+        if std::fs::rename(&trash_file, &target_expected_path).is_err() {
+            std::fs::copy(&trash_file, &target_expected_path)
+                .map_err(|e| format!("Failed to restore file from trash: {e}"))?;
+            let _ = std::fs::remove_file(&trash_file);
+        }
+
+        let trashinfo_file = info_dir.join(format!("{file_name}.trashinfo"));
+        if trashinfo_file.exists() {
+            let _ = std::fs::remove_file(&trashinfo_file);
+        }
+
+        Ok(target_expected_path)
     }
 }
 
@@ -293,7 +352,17 @@ pub fn query_recycle_bin_file_names() -> HashSet<String> {
 
 #[cfg(not(windows))]
 pub fn query_recycle_bin_file_names() -> HashSet<String> {
-    HashSet::new()
+    let mut set = HashSet::new();
+    if let Some((files_dir, _)) = get_linux_trash_dirs() {
+        if let Ok(entries) = std::fs::read_dir(files_dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    set.insert(name.to_lowercase());
+                }
+            }
+        }
+    }
+    set
 }
 
 /// A background watcher that periodically monitors the Recycle Bin

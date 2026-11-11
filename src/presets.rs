@@ -11,6 +11,7 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
+    #[allow(dead_code)]
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::NvencHevc => "NVIDIA NVENC HEVC (H.265)",
@@ -46,23 +47,87 @@ pub enum TargetResolution {
 }
 
 impl TargetResolution {
+    #[allow(dead_code)]
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Source => "Original (Keep Source)",
-            Self::P1440 => "1440p (2560x1440)",
-            Self::P1080 => "1080p (1920x1080)",
-            Self::P4K => "4K (3840x2160)",
             Self::P720 => "720p (1280x720)",
+            Self::P1080 => "1080p (1920x1080)",
+            Self::P1440 => "1440p (2560x1440)",
+            Self::P4K => "4K (3840x2160)",
         }
     }
 
     pub fn max_height(&self) -> Option<u32> {
         match self {
             Self::Source => None,
-            Self::P1440 => Some(1440),
-            Self::P1080 => Some(1080),
-            Self::P4K => Some(2160),
             Self::P720 => Some(720),
+            Self::P1080 => Some(1080),
+            Self::P1440 => Some(1440),
+            Self::P4K => Some(2160),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AutoQualityLevel {
+    Low,
+    #[default]
+    Med,
+    High,
+}
+
+impl AutoQualityLevel {
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => Self::Low,
+            2 => Self::High,
+            _ => Self::Med,
+        }
+    }
+
+    pub fn to_index(&self) -> usize {
+        match self {
+            Self::Low => 0,
+            Self::Med => 1,
+            Self::High => 2,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Med => "Med",
+            Self::High => "High",
+        }
+    }
+}
+
+pub fn auto_bitrate_range(height: u32, level: AutoQualityLevel) -> (f32, f32) {
+    if height <= 720 {
+        match level {
+            AutoQualityLevel::Low => (2.5, 8.0),
+            AutoQualityLevel::Med => (4.0, 15.0),
+            AutoQualityLevel::High => (6.0, 20.0),
+        }
+    } else if height <= 1080 {
+        match level {
+            AutoQualityLevel::Low => (4.0, 16.0),
+            AutoQualityLevel::Med => (6.0, 25.0),
+            AutoQualityLevel::High => (9.0, 35.0),
+        }
+    } else if height <= 1440 {
+        match level {
+            AutoQualityLevel::Low => (6.5, 22.0),
+            AutoQualityLevel::Med => (9.0, 30.0),
+            AutoQualityLevel::High => (14.0, 45.0),
+        }
+    } else {
+        match level {
+            AutoQualityLevel::Low => (10.0, 32.0),
+            AutoQualityLevel::Med => (14.0, 45.0),
+            AutoQualityLevel::High => (22.0, 65.0),
         }
     }
 }
@@ -83,11 +148,11 @@ impl QualityPreset {
     pub fn default_presets() -> Vec<Self> {
         vec![
             Self {
-                id: "1440p_default".to_string(),
-                name: "1440p (9 Mb/s avg, 30 Mb/s max)".to_string(),
-                resolution: TargetResolution::P1440,
-                avg_bitrate_mbps: 9.0,
-                max_bitrate_mbps: 30.0,
+                id: "auto".to_string(),
+                name: "Auto (Original Res)".to_string(),
+                resolution: TargetResolution::Source,
+                avg_bitrate_mbps: 8.0,
+                max_bitrate_mbps: 25.0,
                 codec: VideoCodec::NvencHevc,
                 audio_bitrate_kbps: 192,
                 is_builtin: true,
@@ -98,6 +163,16 @@ impl QualityPreset {
                 resolution: TargetResolution::P1080,
                 avg_bitrate_mbps: 6.0,
                 max_bitrate_mbps: 25.0,
+                codec: VideoCodec::NvencHevc,
+                audio_bitrate_kbps: 192,
+                is_builtin: true,
+            },
+            Self {
+                id: "1440p_default".to_string(),
+                name: "1440p (9 Mb/s avg, 30 Mb/s max)".to_string(),
+                resolution: TargetResolution::P1440,
+                avg_bitrate_mbps: 9.0,
+                max_bitrate_mbps: 30.0,
                 codec: VideoCodec::NvencHevc,
                 audio_bitrate_kbps: 192,
                 is_builtin: true,
@@ -165,13 +240,13 @@ mod tests {
     #[test]
     fn test_default_presets() {
         let presets = QualityPreset::default_presets();
-        assert_eq!(presets.len(), 4);
+        assert_eq!(presets.len(), 5);
 
-        // 1440p preset verification
-        let p1440 = presets.iter().find(|p| p.resolution == TargetResolution::P1440).unwrap();
-        assert_eq!(p1440.avg_bitrate_mbps, 9.0);
-        assert_eq!(p1440.max_bitrate_mbps, 30.0);
-        assert_eq!(p1440.codec, VideoCodec::NvencHevc);
+        // Auto preset verification
+        let auto = &presets[0];
+        assert_eq!(auto.id, "auto");
+        assert_eq!(auto.resolution, TargetResolution::Source);
+        assert_eq!(auto.codec, VideoCodec::NvencHevc);
 
         // 1080p preset verification
         let p1080 = presets.iter().find(|p| p.resolution == TargetResolution::P1080).unwrap();
@@ -179,10 +254,35 @@ mod tests {
         assert_eq!(p1080.max_bitrate_mbps, 25.0);
         assert_eq!(p1080.codec, VideoCodec::NvencHevc);
 
+        // 1440p preset verification
+        let p1440 = presets.iter().find(|p| p.resolution == TargetResolution::P1440).unwrap();
+        assert_eq!(p1440.avg_bitrate_mbps, 9.0);
+        assert_eq!(p1440.max_bitrate_mbps, 30.0);
+        assert_eq!(p1440.codec, VideoCodec::NvencHevc);
+
         // 4K preset verification
         let p4k = presets.iter().find(|p| p.resolution == TargetResolution::P4K).unwrap();
         assert_eq!(p4k.avg_bitrate_mbps, 14.0);
         assert_eq!(p4k.max_bitrate_mbps, 45.0);
         assert_eq!(p4k.codec, VideoCodec::NvencHevc);
+    }
+
+    #[test]
+    fn test_auto_bitrate_range() {
+        let (low_1080, max_1080) = auto_bitrate_range(1080, AutoQualityLevel::Med);
+        assert_eq!(low_1080, 6.0);
+        assert_eq!(max_1080, 25.0);
+
+        let (low_1440, max_1440) = auto_bitrate_range(1440, AutoQualityLevel::Med);
+        assert_eq!(low_1440, 9.0);
+        assert_eq!(max_1440, 30.0);
+
+        let (low_4k, max_4k) = auto_bitrate_range(2160, AutoQualityLevel::Med);
+        assert_eq!(low_4k, 14.0);
+        assert_eq!(max_4k, 45.0);
+
+        let (low_720, max_720) = auto_bitrate_range(720, AutoQualityLevel::Low);
+        assert_eq!(low_720, 2.5);
+        assert_eq!(max_720, 8.0);
     }
 }
