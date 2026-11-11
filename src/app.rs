@@ -181,6 +181,26 @@ pub fn draw_scissors_icon(p: &egui::Painter, center: Pos2, color: Color32) {
     p.circle_filled(center + vec2(0.5, 0.0), 1.2, color);
 }
 
+pub fn draw_play_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    // Sharp right-pointing triangle, optically centered:
+    let c = center + vec2(0.75, 0.0);
+    let p1 = c + vec2(-4.5, -5.5);
+    let p2 = c + vec2(-4.5, 5.5);
+    let p3 = c + vec2(5.5, 0.0);
+    p.add(egui::Shape::convex_polygon(vec![p1, p2, p3], color, Stroke::NONE));
+}
+
+pub fn draw_pause_icon(p: &egui::Painter, center: Pos2, color: Color32) {
+    // Two crisp rounded vertical bars:
+    let h = 5.5;
+    let w = 2.4;
+    let gap = 2.0;
+    let rect_left = Rect::from_min_max(center + vec2(-gap - w, -h), center + vec2(-gap, h));
+    let rect_right = Rect::from_min_max(center + vec2(gap, -h), center + vec2(gap + w, h));
+    p.rect_filled(rect_left, 1.0, color);
+    p.rect_filled(rect_right, 1.0, color);
+}
+
 pub fn draw_trash_icon(p: &egui::Painter, center: Pos2, color: Color32) {
     let stroke = Stroke::new(1.4, color);
     // Lid handle loop
@@ -2058,14 +2078,55 @@ impl ZTrimApp {
 
                 // Transport Controls Row
                 ui.horizontal(|ui| {
-                    let play_txt = if player.is_playing { "Pause" } else { "Play" };
-                    let play_btn = egui::Button::new(RichText::new(play_txt).size(12.0).strong().color(Color32::WHITE))
-                        .fill(if player.is_playing { ACCENT } else { CARD_HI })
-                        .stroke(Stroke::new(1.0, LINE))
-                        .corner_radius(6)
-                        .min_size(vec2(52.0, 26.0));
-                    if ui.add(play_btn).clicked() {
+                    let is_playing = player.is_playing;
+                    let (play_rect, play_resp) = ui.allocate_exact_size(
+                        vec2(48.0, 26.0),
+                        Sense::click(),
+                    );
+                    if play_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if play_resp.clicked() {
                         player.toggle_play();
+                    }
+                    let play_resp = play_resp.on_hover_text(if is_playing { "Pause (Space)" } else { "Play (Space)" });
+
+                    let is_pressed = play_resp.is_pointer_button_down_on();
+                    let is_hovered = play_resp.hovered();
+
+                    let bg = if is_playing {
+                        if is_pressed {
+                            Color32::from_rgb(109, 40, 217)
+                        } else if is_hovered {
+                            Color32::from_rgb(139, 92, 246)
+                        } else {
+                            ACCENT
+                        }
+                    } else {
+                        if is_pressed {
+                            Color32::from_rgb(26, 28, 34)
+                        } else if is_hovered {
+                            Color32::from_rgb(46, 50, 60)
+                        } else {
+                            CARD_HI
+                        }
+                    };
+
+                    let border = if is_hovered {
+                        Stroke::new(1.0, if is_playing { Color32::from_rgb(196, 181, 253) } else { Color32::from_rgb(90, 95, 110) })
+                    } else {
+                        Stroke::new(1.0, LINE)
+                    };
+
+                    let p = ui.painter();
+                    p.rect_filled(play_rect, 6.0, bg);
+                    p.rect_stroke(play_rect, 6.0, border, StrokeKind::Inside);
+
+                    let icon_col = Color32::WHITE;
+                    if is_playing {
+                        draw_pause_icon(&p, play_rect.center(), icon_col);
+                    } else {
+                        draw_play_icon(&p, play_rect.center(), icon_col);
                     }
 
                     if ui.button("< 1f").clicked() {
@@ -3622,5 +3683,21 @@ mod tests {
         let font_id = egui::FontId::new(15.0, egui::FontFamily::Name("button_font".into()));
         let galley = ctx.fonts_mut(|f| f.layout_no_wrap("TRIM / COMPRESS".into(), font_id, Color32::WHITE));
         assert!(galley.size().x > 10.0);
+    }
+
+    #[test]
+    fn test_draw_play_and_pause_icons() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let p = ui.painter();
+                let center = Pos2::new(50.0, 50.0);
+                draw_play_icon(p, center, Color32::WHITE);
+                draw_pause_icon(p, center, Color32::WHITE);
+                draw_scissors_icon(p, center, Color32::WHITE);
+                draw_trash_icon(p, center, Color32::WHITE);
+            });
+        });
+        output.textures_delta.clear();
     }
 }

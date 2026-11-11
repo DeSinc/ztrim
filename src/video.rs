@@ -151,9 +151,10 @@ impl AudioPlayer {
     pub fn new(audio_bytes: Vec<u8>) -> Option<Self> {
         let sink = rodio::stream::DeviceSinkBuilder::open_default_sink().ok()?;
         let player = rodio::Player::connect_new(sink.mixer());
+        player.pause();
         let decoder = rodio::Decoder::new(Cursor::new(audio_bytes.clone())).ok()?;
         player.append(decoder);
-        player.play();
+        player.pause();
         Some(Self {
             _sink: sink,
             player,
@@ -485,6 +486,9 @@ impl VideoPlayer {
                 if let Some(ref mut audio) = audio_opt {
                     if !self.is_playing || self.playback_start_instant.is_none() {
                         audio.pause();
+                        if !self.current_sec.is_nan() && self.current_sec > 0.0 {
+                            audio.seek(Duration::from_secs_f64(self.current_sec), false);
+                        }
                     } else {
                         audio.seek(Duration::from_secs_f64(self.current_sec), true);
                     }
