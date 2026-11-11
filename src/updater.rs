@@ -289,20 +289,34 @@ pub fn check_for_updates(state: Arc<Mutex<UpdaterState>>, ctx: eframe::egui::Con
     });
 }
 
+/// Clean up any leftover .old or .update.tmp files from previous updates
+pub fn cleanup_old_executable() {
+    if let Ok(exe) = std::env::current_exe() {
+        let old = exe.with_extension("old");
+        if old.is_file() {
+            let _ = std::fs::remove_file(&old);
+        }
+        let tmp = exe.with_extension("update.tmp");
+        if tmp.is_file() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 /// Detaches and cleanly restarts the newly updated ztrim application
 pub fn restart_application() {
     let exe = std::env::current_exe().unwrap_or_default();
-    let target_exe = if exe.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("old")).unwrap_or(false) {
+    let (target_exe, old_exe) = if exe.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("old")).unwrap_or(false) {
         #[cfg(windows)]
         {
-            exe.with_extension("exe")
+            (exe.with_extension("exe"), Some(exe.clone()))
         }
         #[cfg(not(windows))]
         {
-            exe.with_extension("")
+            (exe.with_extension(""), Some(exe.clone()))
         }
     } else {
-        exe
+        (exe.clone(), Some(exe.with_extension("old")))
     };
 
     if !target_exe.is_file() {
@@ -310,26 +324,51 @@ pub fn restart_application() {
         return;
     }
 
+    let work_dir = target_exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
         let target_str = target_exe.to_string_lossy().to_string();
+        let work_dir_str = work_dir.to_string_lossy().to_string();
+        let old_str = old_exe.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+
         let ps_cmd = format!(
-            "Start-Sleep -Milliseconds 600; Start-Process -FilePath '{}'",
-            target_str.replace('\'', "''")
+            "for ($i=0; $i -lt 10; $i++) {{ Start-Sleep -Milliseconds 300; if (-not (Test-Path -LiteralPath '{}')) {{ break }}; Remove-Item -LiteralPath '{}' -Force -ErrorAction SilentlyContinue }}; Start-Process -FilePath '{}' -WorkingDirectory '{}'",
+            old_str.replace('\'', "''"),
+            old_str.replace('\'', "''"),
+            target_str.replace('\'', "''"),
+            work_dir_str.replace('\'', "''")
         );
+
+        // Try spawning with CREATE_BREAKAWAY_FROM_JOB first. If parent is inside a restrictive job object
+        // (e.g. IDE, terminal host), CreateProcess fails with Access is denied (code 5), so fall back without it.
         let mut cmd = std::process::Command::new("powershell");
         cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
-        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS);
-        let _ = cmd.spawn();
+        cmd.current_dir(work_dir);
+        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        let spawn_res = cmd.spawn();
+
+        if spawn_res.is_err() {
+            let mut fallback = std::process::Command::new("powershell");
+            fallback.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd]);
+            fallback.current_dir(work_dir);
+            fallback.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            let _ = fallback.spawn();
+        }
+
         std::process::exit(0);
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new(target_exe).spawn();
+        if let Some(old) = old_exe {
+            let _ = std::fs::remove_file(old);
+        }
+        let _ = std::process::Command::new(target_exe).current_dir(work_dir).spawn();
         std::process::exit(0);
     }
 }
@@ -500,5 +539,31 @@ mod tests {
         assert_eq!(select_best_version(gh_older.clone(), None).unwrap().version, "0.1.5");
         assert_eq!(select_best_version(None, srv_newer.clone()).unwrap().version, "0.1.6");
         assert!(select_best_version(None, None).is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_spawn_restart_cmd() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+        let ps_cmd = "Get-Date";
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd]);
+        cmd.creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        let res = cmd.spawn();
+
+        let final_res = if res.is_err() {
+            let mut fallback = std::process::Command::new("powershell");
+            fallback.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd]);
+            fallback.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            fallback.spawn()
+        } else {
+            res
+        };
+
+        assert!(final_res.is_ok(), "Restart process spawning must succeed via primary or fallback: {:?}", final_res);
     }
 }

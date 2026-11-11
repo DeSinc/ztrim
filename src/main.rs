@@ -24,6 +24,8 @@ fn load_app_icon() -> Option<eframe::egui::IconData> {
 }
 
 fn main() -> eframe::Result {
+    updater::cleanup_old_executable();
+
     let args: Vec<String> = std::env::args().collect();
     let initial_file = if args.len() > 1 {
         let path = PathBuf::from(&args[1]);
