@@ -4,7 +4,8 @@ A lightning-fast, pure native Rust video trimming and compression desktop tool b
 
 https://github.com/user-attachments/assets/be507e37-3843-47ca-b13c-3132e88698a4
 
-<img width="559" height="241" alt="ztrim_5xWvVOk3xx" src="https://github.com/user-attachments/assets/c9f6838f-8275-4538-93c0-dc93a19949b1" />
+<img width="559" height="241" alt="ztrim_5xWvVOk3xx" src="https://github.com/user-attachments/assets/c9f6838f-8275-4538-93c0-dc93a19949b1" /><img width="358" height="327" alt="image" src="https://github.com/user-attachments/assets/77819f03-f0e1-433a-b5a9-7173a2021e07" />
+
 
 ---
 
